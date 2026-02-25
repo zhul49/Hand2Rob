@@ -1,0 +1,6 @@
+defaults:
+  - _self_
+
+task_name: cup_stack
+object_labels: [cup_stack]
+num_object_points: 6  # Change this to 6 to match your manual labels

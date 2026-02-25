@@ -231,7 +231,9 @@ for TASK_NAME in task_names:
                         pixel_key, last_n_frames=mark_every, is_first_step=True
                     )
                 except:
+                    import traceback
                     print(f"Error in tracking hand points for {pixel_key}")
+                    traceback.print_exc()
                     points_class.reset_episode()
                     save = False
                     continue

@@ -6,8 +6,8 @@ defaults:
   - override hydra/launcher: submitit_local
 
 # Dir
-root_dir: /path/to/dir
-data_dir: /path/to/expert_demos
+root_dir: /home/wsi3567/Point-Policy
+data_dir: /home/wsi3567/Point-Policy/Franka-Teach/data/processed_data_pkl/expert_demos
 
 # misc
 seed: 2
@@ -17,7 +17,7 @@ use_tb: true
 batch_size: 64
 
 # experiment
-num_demos_per_task: 100
+num_demos_per_task: 50
 policy_head: deterministic
 use_proprio: false
 eval: false
@@ -33,7 +33,7 @@ expert_dataset: ${dataloader.bc_dataset}
 
 # Load weights
 load_bc: false
-bc_weight: path/to/weight
+bc_weight: /home/wsi3567/Point-Policy/point_policy/exp_local/2026.02.12/point_policy/deterministic/090813_hidden_dim_256/snapshot/100000.pt
 
 hydra:
   run:

@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - franka_env: 0121_bottle_on_rack
+  - franka_env: pingpong2
 
 suite: franka_env
 

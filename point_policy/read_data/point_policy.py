@@ -166,8 +166,8 @@ class BCDataset(IterableDataset):
                 ),
             },
             "gripper_states": {
-                "min": -2.0,
-                "max": 2.0,
+                "min": -1.0,
+                "max": 1.0,
             },
         }
 

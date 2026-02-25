@@ -295,6 +295,23 @@ class BCAgent:
             )
             past_tracks = torch.cat([past_tracks, past_gripper_states], dim=1)
 
+        if step % 10 == 0:
+            print(f"\n[MODEL INPUT DEBUG - Step {step}]")
+            print(f"  past_tracks shape: {past_tracks.shape}")
+            print(f"  Number of points: {past_tracks.shape[1]} (should be {self.num_track_points} + 1 gripper)")
+            if self.pred_gripper:
+                print(f"  Current gripper state: {obs['features'][-1]:.3f}")
+            # Show ALL points
+            all_pts = obs[f"point_tracks_{self.pixel_keys[0]}"]
+            print(f"  Robot points (0-8):")
+            for i in range(min(3, len(all_pts))):  # First 3 robot points
+                pt = all_pts[i]
+                print(f"    Point {i}: [{pt[0]:.3f}, {pt[1]:.3f}, {pt[2]:.3f}]")
+            if len(all_pts) > 9:  # Object points exist
+                print(f"  Object points (9-13):")
+                for i in range(9, min(14, len(all_pts))):
+                    pt = all_pts[i]
+                    print(f"    Point {i}: [{pt[0]:.3f}, {pt[1]:.3f}, {pt[2]:.3f}]")
         # encode past tracks
         past_tracks = self.point_projector(past_tracks)
 

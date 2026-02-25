@@ -21,3 +21,5 @@ use_object_points: ${suite.use_object_points}
 num_object_points: ${suite.num_object_points}
 point_dim: ${suite.point_dim}
 pred_gripper: true
+predict_force: ${suite.predict_force}
+mask_force: ${suite.mask_force}

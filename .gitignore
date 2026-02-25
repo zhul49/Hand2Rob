@@ -179,3 +179,13 @@ cython_debug/
 expert_demos/
 coordinates*/
 calib/
+# Ignore video and data files
+*.mp4
+videos_pkl/
+
+# Ignore local training experiments and checkpoints
+exp_local/
+
+# Ignore backups
+*.backup
+Depth-Anything-V2/

@@ -4,11 +4,15 @@ import numpy as np
 import pickle as pkl
 from pathlib import Path
 from scipy.spatial.transform import Rotation as R
+from scipy.spatial.transform import Slerp
 from scipy.ndimage import zoom
 
 from gripper_points import extrapoints, Tshift
 from utils import camera2pixelkey, rigid_transform_3D
 
+print("=" * 60)
+print("SCRIPT STARTED")
+print("=" * 60)
 
 def resize_depth_image(depth_image, new_size):
     # Calculate zoom factors
@@ -20,6 +24,27 @@ def resize_depth_image(depth_image, new_size):
     resized_depth = zoom(depth_image, zoom_factors, order=1)
     return resized_depth
 
+# def add_perp_point(points):
+#     # points shape: (N, 3)
+#     p1 = points[0] # Wrist/Knuckle
+#     p2 = points[-1] # Finger Tip
+    
+#     # Vector along the finger
+#     v = p2 - p1
+    
+#     # Create a vector perpendicular to the finger (e.g., straight Up in Z)
+#     # Ideally, cross product with "Up" vector (0,0,1) to find "Right"
+#     up = np.array([0, 0, 1])
+#     perp = np.cross(v, up)
+    
+#     # If the finger is pointing straight up, use X axis instead
+#     if np.linalg.norm(perp) < 0.001:
+#         perp = np.cross(v, np.array([1, 0, 0]))
+        
+#     perp = perp / np.linalg.norm(perp) * 0.05 # 5cm offset
+    
+#     new_point = p1 + perp
+#     return np.vstack([points, new_point])
 
 # Create the parser
 parser = argparse.ArgumentParser(
@@ -53,11 +78,21 @@ if use_gt_depth:
 # orientation of the robot at the 0th step
 robot_base_orientation = R.from_rotvec([np.pi, 0, 0]).as_matrix()
 
+last_robot_pos = None          # <--- Fixes your NameError
+last_robot_rot = None
+smoothing_factor = 0.2
+pos_smoothing = 0.3
+
 DATA_DIR = DATA_DIR / "processed_data_pkl"
 SAVE_DIR = DATA_DIR / "expert_demos" / "franka_env"
 
+print("=" * 60)
+print("SCRIPT STARTED")
+print("=" * 60)
+
 calibration_data = np.load(CALIB_PATH, allow_pickle=True).item()
 DATA = pkl.load(open(DATA_DIR / f"{task_name}.pkl", "rb"))
+print(f"Loaded data with {len(DATA['observations'])} observations")
 
 # make sure SAVE_DIR exists
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
@@ -68,6 +103,9 @@ observations = DATA["observations"]
 index_finger_thumb_pairs = [
     (idx1, idx2) for idx1 in index_finger_indices for idx2 in thumb_indices
 ]
+
+is_gripper_closed = False
+frames_since_open_condition = 0
 
 observations = []
 for obs_idx, observation in enumerate(DATA["observations"]):
@@ -105,6 +143,12 @@ for obs_idx, observation in enumerate(DATA["observations"]):
             ]
             robot_pos = (hand_point[index_finger_idx] + hand_point[thumb_idx]) / 2
 
+            if last_robot_pos is not None:
+                # Interpolate: 30% new position, 70% old position
+                robot_pos = (pos_smoothing * robot_pos) + ((1 - pos_smoothing) * last_robot_pos)
+            
+            last_robot_pos = robot_pos
+
             if idx == 0:
                 robot_ori = robot_base_orientation
                 base_hand_points = hand_point.copy()
@@ -114,6 +158,29 @@ for obs_idx, observation in enumerate(DATA["observations"]):
                 rot, pos = rigid_transform_3D(base_hand_points, current_hand_points)
 
                 robot_ori = rot @ robot_base_orientation
+
+            current_rot_obj = R.from_matrix(robot_ori)
+
+            if last_robot_rot is not None:
+                # 1. Create a Slerp interpolator between Old and New
+                key_rots = R.from_matrix([last_robot_rot.as_matrix(), current_rot_obj.as_matrix()])
+                key_times = [0, 1]
+                slerp = Slerp(key_times, key_rots)
+                
+                # 2. Interpolate
+                # smoothing_factor (e.g., 0.4) means:
+                # "Move 40% of the way towards the new rotation."
+                # This kills high-frequency jitter.
+                smoothed_rot = slerp([smoothing_factor])[0]
+                
+                # 3. Update robot_ori with the smoothed version
+                robot_ori = smoothed_rot.as_matrix()
+                
+                # Update history (keep the smoothed version as the new baseline)
+                last_robot_rot = smoothed_rot
+            else:
+                # First frame, just save it
+                last_robot_rot = current_rot_obj
 
             # store human pose
             human_poses.append(
@@ -128,14 +195,40 @@ for obs_idx, observation in enumerate(DATA["observations"]):
             # shift the point
             T_g_b = T_g_b @ Tshift
 
+            raw_open_signal = (index_finger_thumb_mindist > 0.06)
+            raw_close_signal = (index_finger_thumb_mindist < 0.05)
+
+            if is_gripper_closed:
+                # LOCKED: Only open if we see "Open" signal for >5 frames
+                if raw_open_signal:
+                    frames_since_open_condition += 1
+                else:
+                    frames_since_open_condition = 0 
+                
+                if frames_since_open_condition > 1:
+                    is_gripper_closed = False
+                    frames_since_open_condition = 0
+            else:
+                # UNLOCKED: Close instantly on pinch
+                if raw_close_signal:
+                    is_gripper_closed = True
+                    frames_since_open_condition = 0
+            
+            gripper_state = 1 if is_gripper_closed else -1
+            # -----------------------------------------
+
             # add extra points
             points3d = [T_g_b[:3, 3]]
-            gripper_state = -1  # -1: open, 1: closed
-            for idx, Tp in enumerate(extrapoints):
-                if index_finger_thumb_mindist < 0.07 and idx in [0, 1]:
+            
+            # Note: I renamed 'idx' to 'p_idx' here to avoid bugs!
+            # (Your original code reused 'idx' from the outer loop, which is dangerous)
+            for p_idx, Tp in enumerate(extrapoints):
+                # Only move the visual gripper points if we are closed
+                if is_gripper_closed and p_idx in [0, 1]:
                     Tp = Tp.copy()
-                    Tp[1, 3] = 0.015 if idx == 0 else -0.015
-                    gripper_state = 1
+                    # Visually pinch the gripper fingers
+                    Tp[1, 3] = 0.015 if p_idx == 0 else -0.015
+                
                 pt = T_g_b @ Tp
                 pt = pt[:3, 3]
                 points3d.append(pt)

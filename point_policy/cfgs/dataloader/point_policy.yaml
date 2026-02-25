@@ -15,6 +15,7 @@ bc_dataset:
   num_object_points: ${suite.num_object_points}
   point_dim: ${suite.point_dim}
   pixel_keys: ${suite.pixel_keys}
-  subsample: 3
+  subsample: ${suite.subsample}
   skip_first_n: 0
   gt_depth: ${suite.gt_depth}
+  predict_force: ${suite.predict_force}

@@ -118,12 +118,63 @@ for TASK_NAME in task_names:
             continue
         states = pkl.load(open(f"{demo_dir}/states.pkl", "rb"))
 
-        state_positions = [state.pos for state in states]
+        #state_positions = [state.pos for state in states]
 
-        state_orientations = [R.from_quat(state.quat).as_rotvec() for state in states]
-        gripper_positions = [state.gripper for state in states]
-        state_timestamps = [state.timestamp for state in states]
-        state_start_teleop = [state.start_teleop for state in states]
+        # state_orientations = [R.from_quat(state.quat).as_rotvec() for state in states]
+        # gripper_positions = [state.gripper for state in states]
+        # state_timestamps = [state.timestamp for state in states]
+        # state_start_teleop = [state.start_teleop for state in states]
+
+        # Modified block to handle dictionary states from our Brute-Force collector
+        state_positions = []
+        state_orientations = []
+        gripper_positions = []
+        state_timestamps = []
+        state_start_teleop = []
+
+        last_valid_rot_matrix = np.eye(3)
+        last_valid_pos = np.zeros(3)
+
+        for i, state in enumerate(states):
+            # Extract Cartesian XYZ from the O_T_EE matrix (elements 12, 13, 14)
+            
+            # Extract Rotation (first 9 elements as a 3x3 matrix) and convert to rotvec
+            full_matrix = np.array(state['O_T_EE']).reshape(4, 4, order='F')
+            rot_matrix = full_matrix[:3, :3]
+            pos = full_matrix[:3, 3]
+            #det = np.linalg.det(rot_matrix)
+            #print(f"DEBUG: Determinant for this frame: {det:.4f}")
+
+            if np.isnan(full_matrix).any() or np.isnan(np.linalg.det(rot_matrix)):
+                print(f"⚠️ Warning: Found NaN in state {i}. Using last valid state.")
+                rot_matrix = last_valid_rot_matrix
+                pos = last_valid_pos
+            else:
+                # Update our "safe" backup
+                last_valid_rot_matrix = rot_matrix
+                last_valid_pos = pos
+
+            try:
+                rotvec = R.from_matrix(rot_matrix).as_rotvec()
+            except Exception as e:
+                # Fallback for any other math errors (like singular matrices)
+                print(f"⚠️ Math Error in state {i}: {e}. Skipping frame.")
+                continue
+
+            state_orientations.append(rotvec)
+            state_positions.append(pos)
+
+            # rotvec = R.from_matrix(rot_matrix).as_rotvec()
+            # state_orientations.append(rotvec)
+
+            # pos = full_matrix[:3, 3]
+            # state_positions.append(pos)
+            
+            # Use 0.0 as default if gripper data wasn't captured
+            gripper_positions.append(state.get('gripper_width', 0.0))
+            state_timestamps.append(state['timestamp'])
+            # Default to True so the script processes all movement
+            state_start_teleop.append(True)
 
         state_positions = np.array(state_positions)
         state_orientations = np.array(state_orientations)
@@ -133,83 +184,69 @@ for TASK_NAME in task_names:
 
         state_timestamps = np.array(state_timestamps)
 
-        # Find indices of timestamps where the robot moves
-        static_timestamps = []
-        static = False
-        start, end = None, None
-        for i in range(1, len(state_positions) - 1):
-            if state_start_teleop[i] == False and static == False:
-                static = True
-                start = i
-            elif state_start_teleop[i] == True and static == True:
-                static = False
-                end = i
-                static_timestamps.append((start, end))
-        if static:
-            static_timestamps.append((start, len(state_positions) - 1))
-
-        # read metadata file
+# --- NEW INTEGRATED SYNC AND METADATA BLOCK ---
         CAM_TIMESTAMPS = []
         CAM_VALID_LENS = []
         skip = False
+        
         for idx in cam_indices:
-            cam_meta_file_path = (
-                f"{demo_dir}/cam_{idx}_{cam_indices[idx]}_video.metadata"
-            )
+            cam_meta_file_path = f"{demo_dir}/cam_{idx}_{cam_indices[idx]}_video.metadata"
+            if not os.path.exists(cam_meta_file_path):
+                print(f"⚠️ Warning: {cam_meta_file_path} not found. Skipping camera {idx}.")
+                continue
+
             with open(cam_meta_file_path, "rb") as f:
                 image_metadata = pkl.load(f)
-                image_timestamps = np.asarray(image_metadata["timestamps"]) / 1000.0
+                # Define cam_timestamps here!
+                cam_timestamps = np.asarray(image_metadata["timestamps"]) / 1000.0
 
-                cam_timestamps = dict(timestamps=image_timestamps)
-            # convert to numpy array
-            cam_timestamps = np.array(cam_timestamps["timestamps"])
+            # 1. Robust Sync Logic: Map frames to closest robot states
+            static_timestamps = []
+            for i, cam_ts in enumerate(cam_timestamps):
+                closest_state_idx = np.argmin(np.abs(state_timestamps - cam_ts))
+                static_timestamps.append((cam_ts, closest_state_idx))
+            
+            if len(static_timestamps) == 0:
+                print(f"❌ No sync points found for Cam {idx}. Skipping demo.")
+                skip = True
+                break
+            
+            print(f"✅ Synced {len(static_timestamps)} frames for cam_{idx}")
 
-            # # Fish eye cam timestamps are divided by 1000
+            # 2. Correct for potential millisecond scaling issues
             if max(cam_timestamps) < state_timestamps[static_timestamps[0][1]]:
                 cam_timestamps *= 1000
-            elif min(cam_timestamps) > state_timestamps[static_timestamps[-1][0]]:
+            elif min(cam_timestamps) > state_timestamps[static_timestamps[-1][1]]:
                 cam_timestamps /= 1000
 
+            # 3. Filter for valid indices based on the state time window
             valid_indices = []
-            if not process_depth or idx == 51:
-                for k in range(len(static_timestamps) - 1):
-                    start_idx = sum(
-                        cam_timestamps < state_timestamps[static_timestamps[k][1]]
-                    )
-                    end_idx = sum(
-                        cam_timestamps < state_timestamps[static_timestamps[k + 1][0]]
-                    )
-                    print(start_idx, end_idx)
-                    valid_indices.extend([i for i in range(start_idx, end_idx)])
-                cam_timestamps = cam_timestamps[valid_indices]
-            else:
-                depth_meta_file_path = f"{demo_dir}/cam_{idx}_depth.metadata"
-                with open(cam_meta_file_path, "rb") as f:
-                    depth_metadata = pkl.load(f)
-                    depth_timestamps = np.asarray(depth_metadata["timestamps"]) / 1000.0
-
-                for k in range(len(static_timestamps) - 1):
-                    start_idx = sum(
-                        depth_timestamps < state_timestamps[static_timestamps[k][1]]
-                    )
-                    end_idx = sum(
-                        depth_timestamps < state_timestamps[static_timestamps[k + 1][0]]
-                    )
-                    valid_indices.extend([i for i in range(start_idx, end_idx)])
-                depth_timestamps = depth_timestamps[valid_indices]
-                DEPTH_FRAMES[idx] = DEPTH_FRAMES[idx][valid_indices] / 1000.0
-
-                valid_indices = []
-                for j, k in enumerate(cam_timestamps):
-                    if k in depth_timestamps:
-                        valid_indices.append(j)
-                cam_timestamps = cam_timestamps[valid_indices]
-                print(len(cam_timestamps), len(depth_timestamps))
-
-            # if no valid timestamps, skip
+            for k in range(len(static_timestamps) - 1):
+                start_idx = sum(cam_timestamps < state_timestamps[static_timestamps[k][1]])
+                end_idx = sum(cam_timestamps < state_timestamps[static_timestamps[k + 1][1]])
+                valid_indices.extend([i for i in range(start_idx, end_idx)])
+            
+            cam_timestamps = cam_timestamps[valid_indices]
+            
             if len(cam_timestamps) == 0:
                 skip = True
                 break
+
+            # 4. Handle Depth if requested
+            if process_depth and idx != 51:
+                depth_meta_file_path = f"{demo_dir}/cam_{idx}_depth.metadata"
+                with open(depth_meta_file_path, "rb") as f:
+                    depth_metadata = pkl.load(f)
+                    depth_timestamps = np.asarray(depth_metadata["timestamps"]) / 1000.0
+                
+                # Match depth indices to the same valid window
+                depth_valid_indices = []
+                for k in range(len(static_timestamps) - 1):
+                    s_idx = sum(depth_timestamps < state_timestamps[static_timestamps[k][1]])
+                    e_idx = sum(depth_timestamps < state_timestamps[static_timestamps[k + 1][1]])
+                    depth_valid_indices.extend([i for i in range(s_idx, e_idx)])
+                
+                DEPTH_FRAMES[idx] = DEPTH_FRAMES[idx][depth_valid_indices] / 1000.0
 
             CAM_VALID_LENS.append(valid_indices)
             CAM_TIMESTAMPS.append(cam_timestamps)
@@ -432,17 +469,28 @@ for TASK_NAME in task_names:
                 for i, indexx in enumerate(indexes):
                     if i % 100 == 0:
                         print(f"Extracting depth frame {i}...")
-                    frame = DEPTH_FRAMES[cidx][indexx]
+                    
+                    # --- FIX START ---
+                    # Ensure indexx does not exceed the number of available depth frames
+                    # RGB and Depth streams might differ by a few frames
+                    valid_depth_idx = min(indexx, len(DEPTH_FRAMES[cidx]) - 1)
+                    
+                    frame = DEPTH_FRAMES[cidx][valid_depth_idx]
+                    # --- FIX END ---
+
                     min_value, max_value = frame.min(), frame.max()
                     frame = (frame - min_value) / (max_value - min_value)
                     colormap = matplotlib.colormaps["magma_r"]
                     frame = colormap(frame, bytes=True)  # ((1)xhxwx4)
                     frame = frame[:, :, :3]  # Discard alpha component
                     # name frame with its timestamp
+                    
+                    # Safety check: ensure we grab a valid timestamp even if we clamped the frame
+                    ts_idx = min(indexx, len(timestamps[idx]) - 1)
                     depth_output_path = os.path.join(
                         depth_output_folder,
                         depth_folder,
-                        f"frame_{i}_{timestamps[idx][indexx]}.jpg",
+                        f"frame_{i}_{timestamps[idx][ts_idx]}.jpg",
                     )
                     cv2.imwrite(depth_output_path, frame)
 
@@ -452,3 +500,4 @@ for TASK_NAME in task_names:
                 )
 
             save_only_videos(output_path, depth=True)
+

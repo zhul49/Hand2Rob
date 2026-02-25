@@ -6,23 +6,25 @@ defaults:
   - override hydra/launcher: submitit_local
 
 # Dir
-root_dir: /path/to/dir
-data_dir: /path/to/expert_demos
+root_dir: /home/wsi3567/Point-Policy
+data_dir: /home/wsi3567/Point-Policy/Franka-Teach/data/processed_data_pkl/expert_demos
 
 # misc
 seed: 2
 device: cuda
 save_video: true
+overlay_keypoints: true
 use_tb: true
 batch_size: 64
 
 # experiment
-num_demos_per_task: 100
+num_demos_per_task: 50
 policy_head: deterministic
 use_proprio: false
 eval: true
 experiment: eval
 experiment_label: ${policy_head}
+replay_demo: false
 
 # action chunking
 temporal_agg: true # aggregate actions over time
@@ -32,7 +34,7 @@ num_queries: 20
 expert_dataset: ${dataloader.bc_dataset}
 
 # Load weights
-bc_weight: path/to/weight
+bc_weight: /home/wsi3567/Point-Policy/point_policy/exp_local/2026.02.12/point_policy/deterministic/090813_hidden_dim_256/snapshot/100000.pt
 
 hydra:
   run:

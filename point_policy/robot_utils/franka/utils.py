@@ -82,40 +82,80 @@ def triangulate_points(P, points):
     return X
 
 
-def rigid_transform_3D(A, B):
+import numpy as np
+from pathlib import Path
+
+def rigid_transform_3D(A, B, ctx=None, dump_dir=None, dump_limit=50, reflect_log=None):
+    """
+    A, B: Nx3
+    ctx: dict with anything you want (demo_idx, obs_idx, cam, frame_idx, etc.)
+    dump_dir: if provided, dumps problematic A/B pairs when reflection happens
+    reflect_log: list to append reflection events for summary
+    """
     assert A.shape == B.shape
+    if A.shape[1] != 3:
+        raise Exception(f"matrix A is not Nx3, it is {A.shape}")
+    if B.shape[1] != 3:
+        raise Exception(f"matrix B is not Nx3, it is {B.shape}")
 
-    num_rows, num_cols = A.shape
-    if num_cols != 3:
-        raise Exception(f"matrix A is not Nx3, it is {num_rows}x{num_cols}")
-
-    num_rows, num_cols = B.shape
-    if num_cols != 3:
-        raise Exception(f"matrix B is not Nx3, it is {num_rows}x{num_cols}")
-
-    # find mean column wise
     centroid_A = np.mean(A, axis=0)
     centroid_B = np.mean(B, axis=0)
 
-    # subtract mean
     Am = A - centroid_A
     Bm = B - centroid_B
 
     H = Am.T @ Bm
 
-    # find rotation
     U, S, Vt = np.linalg.svd(H)
-    R = Vt.T @ U.T
+    Rm = Vt.T @ U.T
+    detR = np.linalg.det(Rm)
 
-    # special reflection case
-    if np.linalg.det(R) < 0:
-        print("det(R) < R, reflection detected!, correcting for it ...")
+    # Useful “degeneracy” signals:
+    # covariance of A, small spread => almost collinear/planar => unstable rotation
+    covA = np.cov(Am.T)
+    evalsA = np.sort(np.linalg.eigvalsh(covA))  # ascending
+    spread = float(evalsA[-1] - evalsA[0])
+
+    # fit error after rotation (before translation)
+    # (not perfect metric, but helpful for ranking)
+    err = float(np.mean(np.linalg.norm((Am @ Rm.T) - Bm, axis=1)))
+
+    if detR < 0:
+        # log with context
+        prefix = "[REFLECT]"
+        if ctx:
+            ctx_str = " ".join([f"{k}={v}" for k, v in ctx.items()])
+            prefix = f"{prefix} {ctx_str}"
+
+        print(f"{prefix} det={detR:+.3f} S={S} evalsA={evalsA} spread={spread:.2e} err={err:.4f}")
+
+        # store event for summary
+        if reflect_log is not None:
+            reflect_log.append({
+                "ctx": dict(ctx) if ctx else {},
+                "det": float(detR),
+                "S": S.copy(),
+                "evalsA": evalsA.copy(),
+                "spread": spread,
+                "err": err,
+            })
+
+        # optionally dump the raw point clouds for later
+        if dump_dir is not None and (reflect_log is None or len(reflect_log) <= dump_limit):
+            dump_dir = Path(dump_dir)
+            dump_dir.mkdir(parents=True, exist_ok=True)
+
+            tag = "unknown"
+            if ctx:
+                tag = "_".join([f"{k}{v}" for k, v in ctx.items()])
+            np.savez_compressed(dump_dir / f"reflect_{tag}.npz", A=A, B=B, S=S, evalsA=evalsA, spread=spread, err=err)
+
+        # correct reflection
         Vt[2, :] *= -1
-        R = Vt.T @ U.T
+        Rm = Vt.T @ U.T
 
-    t = -R @ centroid_A.T + centroid_B.T
-
-    return R, t
+    t = -Rm @ centroid_A.T + centroid_B.T
+    return Rm, t
 
 
 def rotation_6d_to_matrix(d6: np.ndarray) -> np.ndarray:

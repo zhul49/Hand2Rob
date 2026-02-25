@@ -77,7 +77,7 @@ class PointsClass:
             # Initialize MediaPipe Hands
             mp_hands = mp.solutions.hands
             self.hands = mp_hands.Hands(
-                static_image_mode=True, max_num_hands=1, min_detection_confidence=0.5
+                static_image_mode=True, max_num_hands=1, model_complexity=1, min_detection_confidence=0.3
             )
             self.hand_tracks = {pixel_key: None for pixel_key in self.pixel_keys}
 
@@ -127,7 +127,7 @@ class PointsClass:
 
         # Set up the depth model
         if use_gt_depth:
-            self.depth_model = Depth("/path/to/Depth-Anything-V2/", device)
+            self.depth_model = Depth("/home/wsi3567/Point-Policy/Depth-Anything-V2", device)
 
         # Set up cotracker
         sys.path.append(root_dir + "/co-tracker/")
@@ -370,52 +370,83 @@ class PointsClass:
             self.tracks[pixel_key] = self.hand_tracks[pixel_key]
 
     def track_points_hand(self, pixel_key):
+        """
+        Track hand keypoints using MediaPipe on the frames currently stored in self.image_list[pixel_key].
+
+        Returns
+        -------
+        np.ndarray of shape (T, num_hand_points, 2)
+            Pixel coordinates (x, y) for each hand keypoint per frame.
+            If MediaPipe fails on a frame, we hold the last valid prediction.
+            If it fails on the very first frame and we have no prior history, we initialize to image center.
+        """
+        # Pull frames from the rolling buffer: (T, H, W, C) in RGB in [0,255]
         frames = (
-            self.image_list[pixel_key][0].cpu().numpy().transpose(0, 2, 3, 1) * 255.0
-        )
-        frames = frames.astype(np.uint8)
+            self.image_list[pixel_key][0].detach().cpu().numpy().transpose(0, 2, 3, 1) * 255.0
+        ).astype(np.uint8)
 
         hand_tracks = []
+
         for frame in frames:
+            # If you're ever unsure about color order, uncomment:
+            # frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
             results = self.hands.process(frame)
+
             if results.multi_hand_landmarks is not None:
+                # Build 9 points: wrist + 4 index finger joints + 4 thumb joints
+                # Wrist: 0
+                # Index: 5,6,7,8
+                # Thumb: 1,2,3,4
                 hand_track = []
+
+                # We expect max_num_hands=1, but loop is fine
                 for hand_landmarks in results.multi_hand_landmarks:
-                    # Wrist landmarks: 0
-                    # Index finger landmarks: 5, 6, 7, 8
-                    # Thumb landmarks: 1, 2, 3, 4
-                    wrist_landmark = hand_landmarks.landmark[0]
-                    index_finger_landmarks = [
-                        hand_landmarks.landmark[i] for i in [5, 6, 7, 8]
-                    ]
-                    thumb_landmarks = [hand_landmarks.landmark[i] for i in [1, 2, 3, 4]]
+                    # Wrist
+                    wrist = hand_landmarks.landmark[0]
+                    hand_track.append([int(wrist.x * frame.shape[1]), int(wrist.y * frame.shape[0])])
 
-                    # Draw wrist
-                    x = int(wrist_landmark.x * frame.shape[1])
-                    y = int(wrist_landmark.y * frame.shape[0])
-                    hand_track.append([x, y])
+                    # Index finger
+                    for i in [5, 6, 7, 8]:
+                        lm = hand_landmarks.landmark[i]
+                        hand_track.append([int(lm.x * frame.shape[1]), int(lm.y * frame.shape[0])])
 
-                    # Draw index finger
-                    for landmark in index_finger_landmarks:
-                        x = int(landmark.x * frame.shape[1])
-                        y = int(landmark.y * frame.shape[0])
-                        hand_track.append([x, y])
+                    # Thumb
+                    for i in [1, 2, 3, 4]:
+                        lm = hand_landmarks.landmark[i]
+                        hand_track.append([int(lm.x * frame.shape[1]), int(lm.y * frame.shape[0])])
 
-                    # Draw thumb
-                    for landmark in thumb_landmarks:
-                        x = int(landmark.x * frame.shape[1])
-                        y = int(landmark.y * frame.shape[0])
-                        hand_track.append([x, y])
+                    # Only use the first hand (since max_num_hands=1)
+                    break
 
-                hand_track = np.array(hand_track)
-                hand_tracks.append(hand_track)
+                curr = np.array(hand_track, dtype=np.float32)
+
+                # Safety: if something weird happens and we didn't get all points, fallback
+                if curr.shape != (self.num_hand_points, 2):
+                    if len(hand_tracks) > 0:
+                        curr = hand_tracks[-1].copy()
+                    elif self.hand_tracks.get(pixel_key) is not None:
+                        curr = self.hand_tracks[pixel_key][0, -1].detach().cpu().numpy()
+                    else:
+                        h, w = frame.shape[0], frame.shape[1]
+                        curr = np.array([[w * 0.5, h * 0.5]] * self.num_hand_points, dtype=np.float32)
+
+                hand_tracks.append(curr)
+
             else:
-                hand_tracks.append(
-                    hand_tracks[-1]
-                    if len(hand_tracks) > 0
-                    else self.hand_tracks[pixel_key][0, -1].cpu()
-                )
-        return np.array(hand_tracks)
+                # No detection this frame: hold last known pose if possible
+                if len(hand_tracks) > 0:
+                    hand_tracks.append(hand_tracks[-1])
+                elif self.hand_tracks.get(pixel_key) is not None:
+                    hand_tracks.append(self.hand_tracks[pixel_key][0, -1].detach().cpu().numpy())
+                else:
+                    # First frame miss and no prior history: initialize to image center
+                    h, w = frame.shape[0], frame.shape[1]
+                    init = np.array([[w * 0.5, h * 0.5]] * self.num_hand_points, dtype=np.float32)
+                    hand_tracks.append(init)
+
+        return np.array(hand_tracks, dtype=np.float32)
+
 
     def get_points(self, pixel_key, last_n_frames=1):
         """

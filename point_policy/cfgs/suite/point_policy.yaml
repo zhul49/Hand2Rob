@@ -46,6 +46,17 @@ feature_key: "features"
 # snapshot
 save_snapshot: true
 
+# force
+force_controller: false
+read_force: true
+desired_force: 80
+force_match_tolerance: 5
+predict_force: true
+mask_force: false
+variable_desired_force: false
+continuous_gripper: false
+subsample: 3
+
 task_make_fn:
   _target_: suite.point_policy.make
   task_name: ${suite.task.task_name}
@@ -65,3 +76,9 @@ task_make_fn:
   points_cfg: ??? # to be specified later
   use_gt_depth: ${suite.gt_depth}
   point_dim: ${suite.point_dim}
+  force_controller: ${suite.force_controller}
+  read_force: ${suite.read_force}
+  desired_force: ${suite.desired_force}
+  force_match_tolerance: ${suite.force_match_tolerance}
+  variable_desired_force: ${suite.variable_desired_force}
+  continuous_gripper: ${suite.continuous_gripper}

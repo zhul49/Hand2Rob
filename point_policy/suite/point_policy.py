@@ -421,11 +421,13 @@ class RGBArrayAsObservationWrapper(dm_env.Environment):
         return robot_pos, ori
 
     def compute_gripper(self, action):
+        print(f"[ACTION DEBUG] Keys in action dict: {action.keys()}")
         gripper_state = action["gripper"][:1]
+        print(f"[GRIPPER DEBUG] pred={gripper_state}, prev={self.prev_gripper_state}")
 
-        if self.prev_gripper_state == -1 and gripper_state > -0.3:
+        if self.prev_gripper_state == -1 and gripper_state > -0.90:
             gripper_state = 1
-        elif self.prev_gripper_state == 1 and gripper_state < 0.6:
+        elif self.prev_gripper_state == 1 and gripper_state < 0.80:
             gripper_state = -1
         else:
             gripper_state = self.prev_gripper_state
@@ -446,6 +448,9 @@ class RGBArrayAsObservationWrapper(dm_env.Environment):
         T_eef = T_target @ np.linalg.inv(self.Tshift)
         target_position = T_eef[:3, 3]
         target_orientation = T_eef[:3, :3]
+
+        target_position[0] -= 0.005
+        target_position[1] -= 0.01
 
         # convert orientation from rotation matrix to quaternion
         target_orientation = R.from_matrix(target_orientation).as_quat()
@@ -629,6 +634,9 @@ def make(
         use_robot=eval,
         use_gt_depth=use_gt_depth,
     )
+
+    if hasattr(env, '_max_episode_steps'):
+        env = env.env
 
     # apply wrappers
     env = RGBArrayAsObservationWrapper(
