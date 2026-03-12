@@ -11,14 +11,14 @@ from pathlib import Path
 import os
 
 # Configuration
-REMOVE_INDICES = [4, 5, 38, 41]
+REMOVE_INDICES = [1, 7, 10, 24, 26, 29, 30, 33, 35, 37, 38, 39, 40, 42, 43, 44, 47, 48, 50, 52, 62]
 
 # Try to find the file in multiple locations
 POSSIBLE_PATHS = [
-    Path.cwd() / 'pingpong2.pkl',  # Current directory
-    Path.home() / 'Point-Policy/Franka-Teach/data/processed_data_pkl/expert_demos/franka_env/pingpong2.pkl',
-    Path('/home/wsi3567/Point-Policy/Franka-Teach/data/processed_data_pkl/expert_demos/franka_env/pingpong2.pkl'),
-    Path('/home/robert/Point-Policy/Franka-Teach/data/processed_data_pkl/expert_demos/franka_env/pingpong2.pkl'),
+    Path.cwd() / 'egg.pkl',  # Current directory
+    Path.home() / 'Point-Policy/Franka-Teach/data/processed_data_pkl/expert_demos/franka_env/egg.pkl',
+    Path('/home/wsi3567/Point-Policy/Franka-Teach/data/processed_data_pkl/expert_demos/franka_env/egg.pkl'),
+    Path('/home/robert/Point-Policy/Franka-Teach/data/processed_data_pkl/expert_demos/franka_env/egg.pkl'),
 ]
 
 def find_file():
@@ -33,12 +33,12 @@ def main():
     input_path = find_file()
     
     if input_path is None:
-        print("❌ Error: Could not find bottle_flip_real_1.pkl")
+        print("❌ Error: Could not find egg.pkl")
         print("\nSearched in:")
         for path in POSSIBLE_PATHS:
             print(f"  - {path}")
         print("\nYou can also provide the path as an argument:")
-        print(f"  python {sys.argv[0]} /path/to/bottle_flip_real_1.pkl")
+        print(f"  python {sys.argv[0]} /path/to/egg.pkl")
         sys.exit(1)
     
     # Allow override via command line
@@ -49,8 +49,8 @@ def main():
             sys.exit(1)
     
     # Set output path in same directory as input
-    output_path = input_path.parent / 'bottle_flip_real_1_cleaned.pkl'
-    backup_path = input_path.parent / 'bottle_flip_real_1_backup.pkl'
+    output_path = input_path.parent / 'egg_cleaned.pkl'
+    backup_path = input_path.parent / 'egg_backup.pkl'
     
     print(f"Found file: {input_path}")
     
@@ -87,8 +87,8 @@ def main():
     print(f"  mv {output_path} {input_path}")
     print(f"\nOr from anywhere:")
     print(f"  cd {input_path.parent}")
-    print(f"  mv bottle_flip_real_1.pkl bottle_flip_real_1_backup.pkl")
-    print(f"  mv bottle_flip_real_1_cleaned.pkl bottle_flip_real_1.pkl")
+    print(f"  mv egg.pkl egg_backup.pkl")
+    print(f"  mv egg_cleaned.pkl egg.pkl")
 
 if __name__ == "__main__":
     main()

@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - franka_env: pingpong2
+  - franka_env: egg
 
 suite: franka_env
 

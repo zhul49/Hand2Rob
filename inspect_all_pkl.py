@@ -5,8 +5,8 @@ import os
 from pathlib import Path
 
 # --- CONFIGURATION ---
-pkl_path = "/home/wsi3567/Point-Policy/Franka-Teach/data/processed_data_pkl/expert_demos/franka_env/bottle_rack.pkl"
-output_dir = "/home/wsi3567/Point-Policy/videos_pkl/bottle_rack"
+pkl_path = "/home/wsi3567/Point-Policy/Franka-Teach/data/processed_data_pkl/expert_demos/franka_env/crisp.pkl"
+output_dir = "/home/wsi3567/Point-Policy/videos_pkl/crisp"
 cameras_to_save = ['pixels1', 'pixels2']  # Save both camera views
 fps = 10
 

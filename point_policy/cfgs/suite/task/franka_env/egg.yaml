@@ -1,0 +1,7 @@
+defaults:
+  - _self_
+
+task_name: egg
+object_labels: [objects]
+num_object_points: 8
+

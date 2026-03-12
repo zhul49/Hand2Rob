@@ -29,6 +29,7 @@ class BCDataset(IterableDataset):
         subsample,
         skip_first_n,
         gt_depth,
+        predict_force=False,
     ):
         tasks = [tasks]  # NOTE: single task for now
 
@@ -85,6 +86,9 @@ class BCDataset(IterableDataset):
             # read
             data = pkl.load(open(str(self._paths[_path_idx]), "rb"))
             observations = data["observations"]
+
+            min_sensor = data.get("min_sensor")
+            max_sensor = data.get("max_sensor")
 
             # store
             self._episodes[_path_idx] = []
@@ -151,7 +155,7 @@ class BCDataset(IterableDataset):
                             if max_track is not None
                             else np.max(track, axis=0)
                         )
-
+        self._predict_force = predict_force
         self.stats = {
             "past_tracks": {
                 "min": min_track,
@@ -166,8 +170,13 @@ class BCDataset(IterableDataset):
                 ),
             },
             "gripper_states": {
-                "min": -1.0,
-                "max": 1.0,
+                "min": -2.0,
+                "max": 2.0,
+            },
+            "force_states": {
+                "min": min_sensor,
+                "max": max_sensor,
+
             },
         }
 
@@ -190,6 +199,13 @@ class BCDataset(IterableDataset):
                 - self.stats["gripper_states"]["min"]
                 + 1e-5
             ),
+            "force_states": lambda x: (x - self.stats["force_states"]["min"])
+            / (
+                self.stats["force_states"]["max"]
+                - self.stats["force_states"]["min"]
+                + 1e-5
+            ),
+
         }
 
         # Samples from envs
@@ -339,6 +355,29 @@ class BCDataset(IterableDataset):
         future_gripper_states = np.lib.stride_tricks.sliding_window_view(
             future_gripper_states, self._num_queries
         )
+                # Add force states sampling
+        if self._predict_force:
+            # Past force states
+            past_force_states = observations[f"sensor_states"][
+                max(0, sample_idx - self._history_len * self._subsample + self._subsample,) 
+                : sample_idx + 1 
+                : self._subsample
+            ]
+            if len(past_force_states) < self._history_len:
+                prior = np.array([past_force_states[0]] * (self._history_len - len(past_force_states)))
+                past_force_states = np.concatenate([prior, past_force_states], axis=0)
+
+            # Future force states
+            future_force_states = observations[f"sensor_states"][
+                start_idx : end_idx : self._subsample
+            ]
+            if len(future_force_states) < num_future_tracks:
+                post = np.array([future_force_states[-1]] * (num_future_tracks - len(future_force_states)))
+                future_force_states = np.concatenate([future_force_states, post], axis=0)
+            future_force_states = future_force_states.reshape(future_force_states.shape[0])
+            future_force_states = np.lib.stride_tricks.sliding_window_view(
+                future_force_states, self._num_queries
+            )
 
         return_dict = {
             "past_tracks": self.preprocess["past_tracks"](past_tracks),
@@ -351,6 +390,14 @@ class BCDataset(IterableDataset):
             ),
             "action_mask": action_mask,
         }
+
+        if self._predict_force:
+            return_dict.update({
+                "past_force_states": self.preprocess["force_states"](past_force_states),
+                "future_force_states": self.preprocess["force_states"](future_force_states),
+            })
+
+
 
         return return_dict
 

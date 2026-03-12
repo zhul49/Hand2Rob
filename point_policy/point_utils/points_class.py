@@ -29,7 +29,9 @@ class PointsClass:
         dift_steps,
         num_points,
         object_labels,
-        use_gt_depth=True,
+        use_gt_depth=False,
+        smooth_tracks=False,
+
         **kwargs,
     ):
         """
@@ -69,6 +71,9 @@ class PointsClass:
         self.device = device
         self.object_labels = object_labels
 
+        self.use_gt_depth = use_gt_depth
+        self.smooth_tracks = smooth_tracks
+
         self.tracks = {pixel_key: None for pixel_key in self.pixel_keys}
         if "human_hand" in self.object_labels:
             # Do hand tracking with MediaPipe
@@ -77,7 +82,7 @@ class PointsClass:
             # Initialize MediaPipe Hands
             mp_hands = mp.solutions.hands
             self.hands = mp_hands.Hands(
-                static_image_mode=True, max_num_hands=1, model_complexity=1, min_detection_confidence=0.3
+                static_image_mode=True, max_num_hands=1, model_complexity=1, min_detection_confidence=0.30
             )
             self.hand_tracks = {pixel_key: None for pixel_key in self.pixel_keys}
 
@@ -316,8 +321,11 @@ class PointsClass:
         """
 
         if self.detect_hand:
-            hand_tracks = self.track_points_hand(pixel_key)
-            hand_tracks = torch.tensor(hand_tracks)
+            hand_tracks, num_misdetections = self.track_points_hand(pixel_key)
+            hand_tracks = torch.tensor(hand_tracks) # torch.Size([16, 9, 2])
+            num_frames = hand_tracks.shape[0]
+            print(f"failed to detect {num_misdetections} out of {num_frames} frames")
+
 
             if not is_first_step:
                 if self.hand_tracks[pixel_key] is None:
@@ -382,71 +390,60 @@ class PointsClass:
         """
         # Pull frames from the rolling buffer: (T, H, W, C) in RGB in [0,255]
         frames = (
-            self.image_list[pixel_key][0].detach().cpu().numpy().transpose(0, 2, 3, 1) * 255.0
-        ).astype(np.uint8)
+            self.image_list[pixel_key][0].cpu().numpy().transpose(0, 2, 3, 1) * 255.0
+        )
+        frames = frames.astype(np.uint8)
 
-        hand_tracks = []
-
-        for frame in frames:
-            # If you're ever unsure about color order, uncomment:
-            # frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
+        hand_tracks=[]
+        num_misdetections = 0
+        self.prev_hand_track = np.zeros((9, 2))
+        for idx, frame in enumerate(frames):
             results = self.hands.process(frame)
-
             if results.multi_hand_landmarks is not None:
-                # Build 9 points: wrist + 4 index finger joints + 4 thumb joints
-                # Wrist: 0
-                # Index: 5,6,7,8
-                # Thumb: 1,2,3,4
                 hand_track = []
+                for hand_landmarks in results.multi_hand_landmarks: # only one hand
+                    # Wrist landmarks: 0
+                    # Index finger landmarks: 5, 6, 7, 8
+                    # Thumb landmarks: 1, 2, 3, 4
 
-                # We expect max_num_hands=1, but loop is fine
-                for hand_landmarks in results.multi_hand_landmarks:
-                    # Wrist
-                    wrist = hand_landmarks.landmark[0]
-                    hand_track.append([int(wrist.x * frame.shape[1]), int(wrist.y * frame.shape[0])])
+                    wrist_landmark = hand_landmarks.landmark[0]
+                    index_finger_landmarks = [
+                        hand_landmarks.landmark[i] for i in [5, 6, 7, 8]
+                    ]
+                    thumb_landmarks = [hand_landmarks.landmark[i] for i in [1, 2, 3, 4]]
 
-                    # Index finger
-                    for i in [5, 6, 7, 8]:
-                        lm = hand_landmarks.landmark[i]
-                        hand_track.append([int(lm.x * frame.shape[1]), int(lm.y * frame.shape[0])])
+                    # Draw wrist
+                    x = int(wrist_landmark.x * frame.shape[1])
+                    y = int(wrist_landmark.y * frame.shape[0])
+                    hand_track.append([x, y])
 
-                    # Thumb
-                    for i in [1, 2, 3, 4]:
-                        lm = hand_landmarks.landmark[i]
-                        hand_track.append([int(lm.x * frame.shape[1]), int(lm.y * frame.shape[0])])
+                    # Draw index finger
+                    for landmark in index_finger_landmarks:
+                        x = int(landmark.x * frame.shape[1])
+                        y = int(landmark.y * frame.shape[0])
+                        hand_track.append([x, y])
 
-                    # Only use the first hand (since max_num_hands=1)
-                    break
+                    # Draw thumb
+                    for landmark in thumb_landmarks:
+                        x = int(landmark.x * frame.shape[1])
+                        y = int(landmark.y * frame.shape[0])
+                        hand_track.append([x, y])
 
-                curr = np.array(hand_track, dtype=np.float32)
-
-                # Safety: if something weird happens and we didn't get all points, fallback
-                if curr.shape != (self.num_hand_points, 2):
-                    if len(hand_tracks) > 0:
-                        curr = hand_tracks[-1].copy()
-                    elif self.hand_tracks.get(pixel_key) is not None:
-                        curr = self.hand_tracks[pixel_key][0, -1].detach().cpu().numpy()
-                    else:
-                        h, w = frame.shape[0], frame.shape[1]
-                        curr = np.array([[w * 0.5, h * 0.5]] * self.num_hand_points, dtype=np.float32)
-
-                hand_tracks.append(curr)
-
+                hand_track = np.array(hand_track) # (9, 2)
+                hand_tracks.append(hand_track)
+                self.prev_hand_track = hand_track
             else:
-                # No detection this frame: hold last known pose if possible
-                if len(hand_tracks) > 0:
-                    hand_tracks.append(hand_tracks[-1])
-                elif self.hand_tracks.get(pixel_key) is not None:
-                    hand_tracks.append(self.hand_tracks[pixel_key][0, -1].detach().cpu().numpy())
+                num_misdetections += 1
+                if self.smooth_tracks:
+                    hand_tracks.append(np.zeros(self.prev_hand_track.shape))
                 else:
-                    # First frame miss and no prior history: initialize to image center
-                    h, w = frame.shape[0], frame.shape[1]
-                    init = np.array([[w * 0.5, h * 0.5]] * self.num_hand_points, dtype=np.float32)
-                    hand_tracks.append(init)
-
-        return np.array(hand_tracks, dtype=np.float32)
-
+                    hand_tracks.append(
+                        hand_tracks[-1]
+                        if len(hand_tracks) > 0
+                        else self.hand_tracks[pixel_key][0, -1].cpu()
+                    )    
+        
+        return np.array(hand_tracks), num_misdetections # (16, 9, 2)
 
     def get_points(self, pixel_key, last_n_frames=1):
         """
@@ -523,11 +520,9 @@ class PointsClass:
         for frame_num in range(last_n_frames):
             for point in range(self.num_points):
                 frame_idx = -1 * (last_n_frames - frame_num)
-
                 x = self.tracks[pixel_key][0, frame_idx, point][0]
                 y = self.tracks[pixel_key][0, frame_idx, point][1]
                 final_points[frame_num, point] = torch.tensor([x, y])
-
         return final_points
 
     def plot_image(self, pixel_key, last_n_frames=1):

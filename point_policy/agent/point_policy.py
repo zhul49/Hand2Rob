@@ -23,12 +23,14 @@ class Actor(nn.Module):
         policy_head="deterministic",
         device="cuda",
         pred_gripper=True,
+        predict_force=False,
     ):
         super().__init__()
 
         self._policy_head = policy_head
         self._repr_dim = repr_dim
         self._act_dim = act_dim
+        self._predict_force = predict_force
 
         self._policy = GPT(
             GPTConfig(
@@ -47,10 +49,12 @@ class Actor(nn.Module):
                 hidden_dim, self._act_dim, hidden_size=hidden_dim, num_layers=2
             )
         elif policy_head == "diffusion":
-            obs_horizon = num_track_points if not pred_gripper else num_track_points + 1
-            pred_horizon = (
-                num_track_points if not pred_gripper else num_track_points + 1
-            )
+            obs_horizon = num_track_points
+            if pred_gripper:
+                obs_horizon += 1
+            if predict_force:
+                obs_horizon += 1
+            pred_horizon = obs_horizon
             self._action_head = DiffusionHead(
                 input_size=hidden_dim,
                 output_size=self._act_dim,
@@ -116,6 +120,8 @@ class BCAgent:
         num_object_points,
         point_dim,
         pred_gripper,
+        predict_force=False,
+        mask_force=True,
     ):
         self.device = device
         self.lr = lr
@@ -126,7 +132,8 @@ class BCAgent:
         self.history_len = history_len if history else 1
         self.eval_history_len = eval_history_len if history else 1
         self.pred_gripper = pred_gripper
-
+        self.predict_force = predict_force
+        self.mask_force = mask_force
         self._use_robot_points = use_robot_points
         self._num_robot_points = num_robot_points
         self._use_object_points = use_object_points
@@ -175,6 +182,7 @@ class BCAgent:
             self.policy_head,
             device,
             self.pred_gripper,
+            predict_force=predict_force,
         ).to(device)
         model_size += sum(p.numel() for p in self.actor.parameters() if p.requires_grad)
 
@@ -212,6 +220,10 @@ class BCAgent:
             self.observation_buffer["past_gripper_states"] = deque(
                 maxlen=self.eval_history_len
             )
+        if self.predict_force:
+            self.observation_buffer["past_force_states"] = deque(
+                maxlen=self.eval_history_len
+            )
 
         # temporal aggregation
         if self.temporal_agg:
@@ -222,7 +234,7 @@ class BCAgent:
                     [
                         self.max_episode_len,
                         self.max_episode_len + self.num_queries,
-                        self._act_dim * (self._num_robot_points + gripper_points),
+                        self._act_dim * (self._num_robot_points + gripper_points + (1 if self.predict_force else 0)),
                     ]
                 ).to(self.device)
 
@@ -246,6 +258,12 @@ class BCAgent:
                     - norm_stats["gripper_states"]["min"]
                     + 1e-5
                 ),
+                "force_states": lambda x: (x - norm_stats["force_states"]["min"])
+                / (
+                    norm_stats["force_states"]["max"]
+                    - norm_stats["force_states"]["min"]
+                    + 1e-5
+                ),
             }
             post_process = {
                 "future_tracks": lambda x: x
@@ -257,6 +275,12 @@ class BCAgent:
                     - norm_stats["gripper_states"]["min"]
                 )
                 + norm_stats["gripper_states"]["min"],
+                "force_states": lambda x: x
+                * (
+                    norm_stats["force_states"]["max"]
+                    - norm_stats["force_states"]["min"]
+                )
+                + norm_stats["force_states"]["min"],
             }
 
         past_tracks = []
@@ -278,12 +302,26 @@ class BCAgent:
             past_gripper_states = np.stack(
                 self.observation_buffer["past_gripper_states"], axis=0
             )
+        if self.predict_force:
+            force_state = preprocess["force_states"](obs["force"])
+            self.observation_buffer["past_force_states"].append(force_state)
+            while (
+                len(self.observation_buffer["past_force_states"]) < self.history_len
+            ):
+                self.observation_buffer["past_force_states"].append(force_state)
+            past_force_states = np.stack(
+                self.observation_buffer["past_force_states"], axis=0
+            )
 
         # convert to tensor
         past_tracks = torch.as_tensor(np.array(past_tracks), device=self.device).float()
         if self.pred_gripper:
             past_gripper_states = torch.as_tensor(
                 np.array(past_gripper_states), device=self.device
+            ).float()
+        if self.predict_force:
+            past_force_states = torch.as_tensor(
+                np.array(past_force_states), device=self.device
             ).float()
 
         # reshape past_tracks
@@ -294,7 +332,6 @@ class BCAgent:
                 past_tracks.shape[0], 1, self._act_dim
             )
             past_tracks = torch.cat([past_tracks, past_gripper_states], dim=1)
-
         if step % 10 == 0:
             print(f"\n[MODEL INPUT DEBUG - Step {step}]")
             print(f"  past_tracks shape: {past_tracks.shape}")
@@ -312,6 +349,18 @@ class BCAgent:
                 for i in range(9, min(14, len(all_pts))):
                     pt = all_pts[i]
                     print(f"    Point {i}: [{pt[0]:.3f}, {pt[1]:.3f}, {pt[2]:.3f}]")
+
+        if self.predict_force:
+            if self.mask_force:
+                past_force_states = torch.zeros_like(past_force_states[None, None]).repeat(
+                    past_tracks.shape[0], 1, self._act_dim
+                )
+            else:
+                past_force_states = past_force_states[None, None].repeat(
+                    past_tracks.shape[0], 1, self._act_dim
+                )
+            past_tracks = torch.cat([past_tracks, past_force_states], dim=1)
+
         # encode past tracks
         past_tracks = self.point_projector(past_tracks)
 
@@ -319,13 +368,20 @@ class BCAgent:
         future_tracks = self.actor(past_tracks, stddev)
 
         if self.policy_head == "deterministic":
-            future_tracks = future_tracks.mean  # .cpu().numpy() # for deterministic
+            future_tracks = future_tracks.mean
 
-        # extract robot and gripper points
+        # extract robot, gripper and force points
         robot_points = future_tracks[:, : self._num_robot_points]
+        extra_points = []
         if self.pred_gripper:
-            gripper_points = future_tracks[:, -1:]
-            robot_points = torch.cat([robot_points, gripper_points], dim=1)
+            gripper_points = future_tracks[:, -2:-1] if self.predict_force else future_tracks[:, -1:]
+            extra_points.append(gripper_points)
+        if self.predict_force:
+            force_points = future_tracks[:, -1:]
+            extra_points.append(force_points)
+        
+        if extra_points:
+            robot_points = torch.cat([robot_points] + extra_points, dim=1)
         future_tracks = robot_points
 
         return_dict = {}
@@ -338,9 +394,13 @@ class BCAgent:
                     .cpu()
                     .numpy()
                 )
-                return_dict["future_gripper_states"] = post_process["gripper_states"](
-                    future_tracks[idx, -1:, :1].cpu().numpy()
-                )
+                if self.pred_gripper:
+                    gripper_idx = -2 if self.predict_force else -1
+                    return_dict["future_gripper_states"] = post_process["gripper_states"](
+                        future_tracks[idx, gripper_idx:gripper_idx+1, :1].cpu().numpy()
+                    )
+                if self.predict_force:
+                    return_dict["future_force_states"] = post_process["force_states"](future_tracks[idx, -1:, :1].cpu().numpy())
         else:
             for idx in range(len(future_tracks)):
                 pixel_key = self.pixel_keys[idx]
@@ -348,9 +408,12 @@ class BCAgent:
                 track = track.view(-1, self.num_queries, self._act_dim)
                 # consider only robot points
                 start_idx = 0
-                end_idx = (
-                    start_idx + self._num_robot_points + (1 if self.pred_gripper else 0)
-                )
+                if self.pred_gripper and self.predict_force:
+                    end_idx = (start_idx + self._num_robot_points + 2)
+                elif self.pred_gripper:
+                    end_idx = (start_idx + self._num_robot_points + 1)
+                else:
+                    end_idx = (start_idx + self._num_robot_points)
                 track = track[start_idx:end_idx]
                 # convert to proper shape
                 track = track.transpose(0, 1).reshape(self.num_queries, -1)[None]
@@ -372,9 +435,13 @@ class BCAgent:
                 return_dict[f"future_tracks_{pixel_key}"] = post_process[
                     "future_tracks"
                 ](track[: self._num_robot_points])
-                return_dict["gripper"] = post_process["gripper_states"](
-                    future_tracks[idx, -1:, :1].cpu().numpy()
-                )
+                if self.pred_gripper:
+                    if self.predict_force:
+                        return_dict['gripper'] = post_process["gripper_states"](track[-2:-1, :1])
+                    else:
+                        return_dict['gripper'] = post_process["gripper_states"](track[-1:, :1])
+                if self.predict_force:
+                    return_dict["future_force_states"] = post_process["force_states"](track[-1:, :1])
 
         return return_dict
 
@@ -387,12 +454,20 @@ class BCAgent:
         past_tracks = data["past_tracks"].float()
         future_tracks = data["future_tracks"].float()
         action_masks = data["action_mask"].float()
+
         if self.pred_gripper:
             past_gripper_states = data["past_gripper_states"].float()
             future_gripper_states = data["future_gripper_states"].float()
-            # Add a dimension to action masks
+            # Add gripper mask
             gripper_mask = torch.ones_like(action_masks)[:, :1]
             action_masks = torch.cat([action_masks, gripper_mask], dim=1)
+
+        if self.predict_force:
+            past_force_states = data["past_force_states"].float()
+            future_force_states = data["future_force_states"].float()
+            # Add force mask
+            force_mask = torch.ones_like(action_masks)[:, :1]
+            action_masks = torch.cat([action_masks, force_mask], dim=1)
 
         # reshape for training
         shape = past_tracks.shape
@@ -402,14 +477,21 @@ class BCAgent:
         if self.pred_gripper:
             past_gripper_states = past_gripper_states[:, None]
             future_gripper_states = future_gripper_states[:, :1]
-
-            # Make last dim of gripper_states same as that of tracks
             past_gripper_states = past_gripper_states.repeat(1, 1, self._act_dim)
             future_gripper_states = future_gripper_states.repeat(1, 1, self._act_dim)
-
-            # add gripper states as (n+1)-th track point
             past_tracks = torch.cat([past_tracks, past_gripper_states], dim=1)
             future_tracks = torch.cat([future_tracks, future_gripper_states], dim=1)
+
+        if self.predict_force:
+            if self.mask_force:
+                past_force_states = torch.zeros_like(past_force_states[:, None])
+            else:
+                past_force_states = past_force_states[:, None]
+            future_force_states = future_force_states[:, :1]
+            past_force_states = past_force_states.repeat(1, 1, self._act_dim)
+            future_force_states = future_force_states.repeat(1, 1, self._act_dim)
+            past_tracks = torch.cat([past_tracks, past_force_states], dim=1)
+            future_tracks = torch.cat([future_tracks, future_force_states], dim=1)
 
         # encode past tracks
         past_tracks = self.point_projector(past_tracks)

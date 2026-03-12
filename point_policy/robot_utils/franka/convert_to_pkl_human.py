@@ -15,6 +15,9 @@ from pandas import read_csv
 from point_utils.points_class import PointsClass
 from utils import (
     camera2pixelkey,
+    sliding_window_outlier_filter,
+    filter_and_interpolate_fingertips,
+
     pixel2d_to_3d_torch,
     triangulate_points,
 )
@@ -31,9 +34,21 @@ parser.add_argument("--task_names", nargs="+", type=str, help="List of task name
 parser.add_argument(
     "--num_demos", type=int, default=None, help="Number of demonstrations to process"
 )
-parser.add_argument("--process_points", action="store_true", help="Process key points")
+parser.add_argument(
+    "--process_points", action="store_true", help="Process human hand points"
+)
+
 parser.add_argument(
     "--use_gt_depth", action="store_true", help="Use ground truth depth"
+)
+parser.add_argument(
+    "--calibrate", action="store_true", help="Calibrate the camera"
+)
+parser.add_argument(
+    '--camera', type=int, nargs='+', default=[1, 2],help='Camera ID'
+)
+parser.add_argument(
+    '--smooth_tracks', action='store_true', help='Smooth the tracks'
 )
 
 
@@ -45,7 +60,7 @@ NUM_DEMOS = args.num_demos
 process_points = args.process_points
 use_gt_depth = args.use_gt_depth
 
-camera_indices = [1, 2]
+camera_indices = args.camera
 original_img_size = (640, 480)
 crop_h, crop_w = (0.0, 1.0), (0.0, 1.0)
 save_img_size = None
@@ -98,6 +113,9 @@ if process_points:
             camera2pixelkey[f"cam_{cam_idx}"] for cam_idx in camera_indices
         ]
         cfg["object_labels"] = object_labels
+        cfg["use_gt_depth"] = use_gt_depth
+        cfg["smooth_tracks"] = args.smooth_tracks
+
 
     points_class = PointsClass(**cfg)
 
@@ -133,14 +151,19 @@ for TASK_NAME in task_names:
         min_cartesian = data["min_cartesian"]
         max_gripper = data["max_gripper"]
         min_gripper = data["min_gripper"]
+        max_sensor = data["max_sensor"]
+        min_sensor = data["min_sensor"]
+
     else:
         observations = []
         max_cartesian, min_cartesian = None, None
         max_gripper, min_gripper = None, None
+        max_sensor, min_sensor = None, None
 
     dirs = [x for x in DATASET_PATH.iterdir() if x.is_dir()]
 
-    for i, data_point in enumerate(sorted(dirs)):
+    # detect_hand_rates = []
+    for i, data_point in enumerate(sorted(dirs, key=lambda x: int(str(x).split("_")[-1]))):
         print(f"Processing data point {i+1}/{len(dirs)}")
 
         if NUM_DEMOS is not None and int(str(data_point).split("_")[-1]) >= NUM_DEMOS:
@@ -194,7 +217,56 @@ for TASK_NAME in task_names:
                 observation[f"depth_{pixel_key}"] = depth
 
         state_csv_path = data_point / "states.csv"
+        sensor_csv_path = data_point / "sensor.csv"
+
         state = read_csv(state_csv_path)
+
+        try:
+            sensor_data = read_csv(sensor_csv_path)
+            sensor_states = sensor_data["sensor_values"].values
+
+            sensor_states = np.array(
+                [
+                    np.array([extract_number(x) for x in sensor.strip("[]").split(",")])
+                    for sensor in sensor_states
+                ],
+                dtype=np.float32,
+            )
+
+            sensor_history = None
+            if "sensor_history" in sensor_data.columns:
+                sensor_history = sensor_data["sensor_history"].values
+                sensor_history = np.array(
+                    [
+                        np.array(
+                            [extract_number(x) for x in sensor.strip("[]").split(",")]
+                        ).reshape((-1, 30))
+                        for sensor in sensor_history
+                    ],
+                    dtype=np.float32,
+                )
+
+            baseline_sensor_state = np.mean(sensor_states[:5], axis=0)
+            sensor_states -= baseline_sensor_state
+            sensor_states = np.linalg.norm(sensor_states[:, :3], axis=1)
+
+            # Update max and min sensor values for normalization
+            if max_sensor is None:
+                max_sensor = np.max(sensor_states, axis=0)
+                min_sensor = np.min(sensor_states, axis=0)
+            else:
+                max_sensor = np.maximum(max_sensor, np.max(sensor_states, axis=0))
+                min_sensor = np.minimum(min_sensor, np.min(sensor_states, axis=0))
+
+            observation["sensor_states"] = sensor_states.astype(np.float32)
+            print(f"  ✅ Sensor data loaded: {len(sensor_states)} frames")
+            use_sensor = True
+
+
+        except FileNotFoundError:
+            use_sensor = False
+            print(f"Sensor data not found for {data_point}")
+            sensor_states, sensor_history = None, None
 
         # Parsing cartesian pose data
         cartesian_states = state["pose_aa"].values
@@ -209,6 +281,7 @@ for TASK_NAME in task_names:
         gripper_states = state["gripper_state"].values.astype(np.float32)
         observation["cartesian_states"] = cartesian_states.astype(np.float32)
         observation["gripper_states"] = gripper_states.astype(np.float32)
+
 
         if process_points:
             # Human hand tracks
@@ -230,10 +303,9 @@ for TASK_NAME in task_names:
                     points_class.track_points(
                         pixel_key, last_n_frames=mark_every, is_first_step=True
                     )
-                except:
-                    import traceback
+                except Exception as e:
+                    print(str(e))
                     print(f"Error in tracking hand points for {pixel_key}")
-                    traceback.print_exc()
                     points_class.reset_episode()
                     save = False
                     continue
@@ -283,7 +355,7 @@ for TASK_NAME in task_names:
 
                     if (idx + 1) % mark_every == 0 or idx == (len(frames) - 2):
                         to_add = mark_every - (idx + 1) % mark_every
-                        if to_add < mark_every:
+                        if to_add < mark_every: # which is when idx == (len(frames) - 2)
                             for j in range(to_add):
                                 points_class.add_to_image_list(image, pixel_key)
                         else:
@@ -297,7 +369,9 @@ for TASK_NAME in task_names:
 
                         points = points_class.get_points_on_image(
                             pixel_key, last_n_frames=mark_every
-                        )
+                        ) # torch.Size([8, 16, 2])
+                        # points[3]  which is the frame
+
                         for j in range(mark_every - to_add):
                             points_list.append(points[j])
 
@@ -312,9 +386,17 @@ for TASK_NAME in task_names:
                                 depth = points_with_depth[j, :, -1]
                                 points3d = pixel2d_to_3d_torch(points[j], depth, K, P)
                                 points_3d_list.append(points3d)
+                
+                if args.smooth_tracks:
+                    cleaned_tensors = sliding_window_outlier_filter(points_list)
+                    indices, interpolated_points = filter_and_interpolate_fingertips(cleaned_tensors)
+                    final_points = interpolated_points
+                else:
+                    final_points = points_list
+
 
                 observation[f"human_tracks_{pixel_key}"] = torch.stack(
-                    points_list
+                    final_points
                 ).numpy()
                 if use_gt_depth:
                     observation[f"human_tracks_3d_{pixel_key}"] = torch.stack(
@@ -400,6 +482,61 @@ for TASK_NAME in task_names:
 
         observations.append(observation)
 
+    # Create video with overlaid points
+    if process_points:
+        print("Creating visualization video...")
+        # Create output directory for videos
+        video_dir = SAVE_DATA_PATH / "point_overlay_videos"
+        video_dir.mkdir(exist_ok=True)
+        video_dir = video_dir / TASK_NAME
+        video_dir.mkdir(exist_ok=True)
+        for i, observation in enumerate(observations):
+            for pixel_key in ['pixels1', 'pixels2', 'pixels3', 'pixels4']:
+                if pixel_key not in observation:
+                    continue
+                frames = observation[pixel_key]
+                points = observation[f"human_tracks_{pixel_key}"]
+          
+                # Initialize video writer
+                base_path = str(video_dir / f"{TASK_NAME}_demo_{i}_{pixel_key}")
+                height, width = frames[0].shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                
+                def write_video(frames, points, output_path, include_sensor=False):
+                    out = cv2.VideoWriter(output_path, fourcc, 30.0, (width, height))
+                    
+                    for frame_idx, (frame, frame_points) in enumerate(zip(frames, points)):
+                        frame = frame.copy()
+                        
+                        # Draw points
+                        for point in frame_points:
+                            x, y = point.astype(int)
+                            cv2.circle(frame, (x, y), radius=3, color=(0, 255, 0), thickness=-1)
+                        
+                        # Add sensor overlay if requested
+                        if include_sensor:
+                            sensor_norm = observation["sensor_states"][frame_idx]
+                            cv2.putText(frame,
+                                    f"Sensor Norm: {sensor_norm:.3f}",
+                                    (50, 50),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    1,
+                                    (0, 0, 255),
+                                    2)
+                        
+                        out.write(frame)
+                        
+                    out.release()
+                    print(f"Saved visualization to {output_path}")
+                    
+                # Write base video
+                write_video(frames, points, f"{base_path}.mp4")
+                
+                # Write video with sensor overlay if sensor data exists
+                if "sensor_states" in observation:
+                    write_video(frames, points, f"{base_path}.mp4", include_sensor=True)
+
+
     # Save data to a pickle file
     data = {
         "observations": observations,
@@ -407,8 +544,11 @@ for TASK_NAME in task_names:
         "min_cartesian": min_cartesian,
         "max_gripper": max_gripper,
         "min_gripper": min_gripper,
+        "max_sensor": max_sensor if max_sensor is not None else None,
+        "min_sensor": min_sensor if min_sensor is not None else None,
     }
     with open(SAVE_DATA_PATH / f"{TASK_NAME}.pkl", "wb") as f:
         pkl.dump(data, f)
+    print(f"Saved data for {TASK_NAME} to {SAVE_DATA_PATH / f'{TASK_NAME}.pkl'}")
 
 print("Processing complete.")

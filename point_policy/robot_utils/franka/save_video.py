@@ -4,8 +4,8 @@ import imageio
 from pathlib import Path
 import cv2
 
-DATA_DIR = Path("/path/to/expert_demos")
-TASK_NAME = "close_oven"
+DATA_DIR = Path("/home/wsi3567/Point-Policy/Franka-Teach/data/processed_data_pkl/expert_demos/franka_env")
+TASK_NAME = "cup_tactile"
 plot_pts = True
 
 DATA_PATH = DATA_DIR / f"{TASK_NAME}.pkl"
@@ -46,12 +46,11 @@ for traj_idx in traj_indices:
             point_tracks = np.concatenate([point_tracks, object_tracks], axis=1)
 
             # Color for each point
+            num_robot_points = np.array(data["observations"][traj_idx][point_track_key]).shape[1]
             num_points = point_tracks.shape[1]
             colors = np.zeros((num_points, 3))
-            third = num_points // 3
-            colors[:third, 0] = 255
-            colors[third : 2 * third, 1] = 255
-            colors[2 * third :, 2] = 255
+            colors[:num_robot_points, 0] = 255        # robot/hand → red
+            colors[num_robot_points:, 1] = 255
 
         save_frames = []
         for i, frame in enumerate(frames):
@@ -74,5 +73,5 @@ for traj_idx in traj_indices:
 
         # Save the video
         save_frames = np.array(save_frames).astype(np.uint8)
-        save_path = SAVE_DIR / f"{TASK_NAME}_traj{traj_idx}_{pixel_key}.mp4"
+        save_path = SAVE_DIR / f"{TASK_NAME}_traj_new{traj_idx}_{pixel_key}.mp4"
         imageio.mimwrite(save_path, save_frames, fps=20)

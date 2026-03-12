@@ -5,8 +5,8 @@ import os
 
 # --- CONFIGURATION ---
 # Path to your processed data file
-pkl_path = "/home/wsi3567/Point-Policy/Franka-Teach/data/processed_data_pkl/pingpong2.pkl"
-output_video_name = "check_points_video.mp4"
+pkl_path = "/home/wsi3567/Point-Policy/Franka-Teach/data/processed_data_pkl/cup_tactile.pkl"
+output_video_name = "cup_tactile_hand.mp4"
 # ---------------------
 
 def visualize_pkl(path):
@@ -19,7 +19,7 @@ def visualize_pkl(path):
         data = pickle.load(f)
 
     # Get the first demo
-    obs = data['observations'][4]
+    obs = data['observations'][49]
     
     # Check if we have the data we need
     if 'pixels2' not in obs or 'human_tracks_pixels2' not in obs:

@@ -3,7 +3,7 @@ import numpy as np
 import shutil
 
 # Path to your bad data
-pkl_path = "/home/wsi3567/Point-Policy/Franka-Teach/data/processed_data_pkl/expert_demos/franka_env/bottle_rack.pkl"
+pkl_path = "/home/wsi3567/Point-Policy/Franka-Teach/data/processed_data_pkl/expert_demos/franka_env/crisp.pkl"
 backup_path = pkl_path + ".backup"
 
 # 1. Backup the file just in case

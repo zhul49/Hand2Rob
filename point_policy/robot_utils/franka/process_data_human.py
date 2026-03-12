@@ -10,6 +10,7 @@ import pickle as pkl
 import matplotlib
 from pathlib import Path
 from scipy.spatial.transform import Rotation as R
+import h5py
 
 # Create the parser
 parser = argparse.ArgumentParser(
@@ -39,6 +40,10 @@ cam_indices = {
     2: "rgb",
 }
 states_file_name = "states"
+
+sensor_file_name = "sensor"
+sensor_history_len = 40
+sensor_history_skip = 0
 
 if task_names is None:
     task_names = [f.name for f in DATA_PATH.iterdir() if f.is_dir()]
@@ -103,6 +108,14 @@ for TASK_NAME in task_names:
         cam_avis = [
             f"{demo_dir}/cam_{i}_{cam_indices[i]}_video.avi" for i in cam_indices
         ]
+        try:
+            with h5py.File(f"{demo_dir}/reskin_sensor_values.h5") as hf:
+                sensor_timestamps = np.array(hf["timestamp"])
+                sensor_values = np.array(hf["sensor_values"])
+            process_sensor = True
+        except FileNotFoundError:
+            print("No sensor values found. Skipping sensor processing.")
+            process_sensor = False
         if process_depth:
             DEPTH_FRAMES = {}
             for i in cam_indices:
@@ -333,6 +346,78 @@ for TASK_NAME in task_names:
             with open(output_path + f"{states_file_name}.csv", "a") as f:
                 min_df.to_csv(f, header=f.tell() == 0, index=False)
 
+        # --- SENSOR PROCESSING (Feel the Force) ---
+        if process_sensor:
+            # Determine the valid time window from the demo
+            demo_start_time = reference_timestamps[0]
+            demo_end_time = reference_timestamps[-1]
+
+            # Filter sensor data to the valid demo time window
+            sensor_valid_mask = (sensor_timestamps >= demo_start_time - 1.0) & (
+                sensor_timestamps <= demo_end_time + 1.0
+            )
+            filtered_sensor_timestamps = sensor_timestamps[sensor_valid_mask]
+            filtered_sensor_values = sensor_values[sensor_valid_mask]
+
+            if len(filtered_sensor_timestamps) > 0:
+                # Build sliding window sensor history
+                sensor_history_tmp = np.concatenate(
+                    [
+                        [filtered_sensor_values[0]]
+                        * (sensor_history_len * (1 + sensor_history_skip) - 1),
+                        filtered_sensor_values,
+                    ],
+                    axis=0,
+                )
+                sensor_history = np.lib.stride_tricks.sliding_window_view(
+                    sensor_history_tmp,
+                    sensor_history_len * (1 + sensor_history_skip),
+                    axis=0,
+                ).transpose(0, 2, 1)
+
+                # Write big_sensor.csv (all valid sensor readings)
+                sensor_timestamps_df = pd.DataFrame(filtered_sensor_timestamps)
+                sensor_values_list = []
+                sensor_history_list = []
+                for i in range(len(filtered_sensor_values)):
+                    sensor_values_list.append(np.array(filtered_sensor_values[i]))
+                    sensor_history_list.append(sensor_history[i].flatten())
+                sensor_values_df = pd.DataFrame(
+                    {"column": [list(row) for row in sensor_values_list]}
+                )
+                sensor_history_df = pd.DataFrame(
+                    {"column": [list(row) for row in sensor_history_list]}
+                )
+
+                sensor_df = pd.concat(
+                    [sensor_timestamps_df, sensor_values_df, sensor_history_df],
+                    axis=1,
+                )
+                with open(output_path + f"big_{sensor_file_name}.csv", "a") as f:
+                    sensor_df.to_csv(
+                        f,
+                        header=["created timestamp", "sensor_values", "sensor_history"],
+                        index=False,
+                    )
+
+                # Match sensor readings to reference timestamps (same approach as states)
+                df_sensor = pd.read_csv(output_path + f"big_{sensor_file_name}.csv")
+                for i in range(len(reference_timestamps)):
+                    curlist = []
+                    for j in range(len(filtered_sensor_timestamps)):
+                        curlist.append(
+                            abs(filtered_sensor_timestamps[j] - reference_timestamps[i])
+                        )
+                    min_index = curlist.index(min(curlist))
+                    min_df = df_sensor.iloc[min_index]
+                    min_df = min_df.to_frame().transpose()
+                    with open(output_path + f"{sensor_file_name}.csv", "a") as f:
+                        min_df.to_csv(f, header=f.tell() == 0, index=False)
+
+                print(f"✅ Sensor data processed: {len(filtered_sensor_timestamps)} readings → {len(reference_timestamps)} synced frames")
+            else:
+                print("⚠️ No sensor data in the valid time window. Skipping sensor CSV.")
+
         # Create folders for each camera if they don't exist
         output_folder = output_path + "videos"
         os.makedirs(output_folder, exist_ok=True)
@@ -500,4 +585,3 @@ for TASK_NAME in task_names:
                 )
 
             save_only_videos(output_path, depth=True)
-

@@ -1,13 +1,124 @@
 import torch
 import numpy as np
+from scipy.interpolate import CubicSpline, interp1d
+from scipy.spatial.transform import Rotation
+from typing import List
 
 camera2pixelkey = {
     "cam_1": "pixels1",
     "cam_2": "pixels2",
+    "cam_3": "pixels3",
+    "cam_4": "pixels4",
     "cam_51": "pixels51",
 }
 pixelkey2camera = {v: k for k, v in camera2pixelkey.items()}
 
+
+import numpy as np
+import torch
+
+import numpy as np
+import torch
+
+def sliding_window_outlier_filter(points_list, window_size=10, std_threshold=1):
+    """
+    Frame-wise outlier detection using sliding window with mean/std.
+    If a frame contains any zeros, it is skipped in calculations.
+    If a frame is an outlier, the entire tensor is set to zero.
+    """
+
+    frame_norms = []
+    valid_mask = np.ones(len(points_list), dtype=bool)  # True if frame is valid (no zeros)
+    
+    for i, tensor in enumerate(points_list):
+        arr = tensor.cpu().numpy() if torch.is_tensor(tensor) else np.array(tensor)
+        frame_norms.append(np.linalg.norm(arr))
+        
+        # Check if the frame contains any zeros
+        if np.any(arr == 0):
+            valid_mask[i] = False
+    
+    frame_norms = np.array(frame_norms)
+    output_list = [tensor.clone() for tensor in points_list]
+    
+    for i in range(len(points_list)):
+        if not valid_mask[i]:
+            continue  # Skip if frame contains zeros
+        
+        # Get sliding window around current frame
+        start = max(0, i - window_size // 2)
+        end = min(len(points_list), i + window_size // 2 + 1)
+        window_indices = np.arange(start, end)
+        
+        # Only consider valid frames in the window
+        valid_window_indices = window_indices[valid_mask[window_indices]]
+        if len(valid_window_indices) == 0:
+            continue  # No valid frames to compare
+        
+        window_norms = frame_norms[valid_window_indices]
+        mean_norm = np.mean(window_norms)
+        std_norm = np.std(window_norms)
+        
+        # Detect if current frame is an outlier
+        if std_norm > 1e-6:  
+            z_score = abs((frame_norms[i] - mean_norm) / std_norm)
+            if z_score > std_threshold:
+                output_list[i] = torch.zeros_like(points_list[i])  
+                valid_mask[i] = False  # Mark as invalid for future windows
+    
+    return output_list
+
+
+def moving_average_filter(signal: np.ndarray, window_size: int, axis: int = 0):
+    if window_size % 2 == 0:
+        window_size += 1
+    pad_width = window_size // 2
+    padded_signal = np.pad(signal, ((pad_width, pad_width), (0, 0)), mode="reflect")
+    kernel = np.ones(window_size) / window_size
+    smoothed = np.apply_along_axis(
+        lambda x: np.convolve(x, kernel, mode="valid"), axis=axis, arr=padded_signal
+    )
+    return smoothed
+
+
+def interpolate_translations(indices: np.ndarray, t: np.ndarray):
+    try:
+        interp_func = interp1d(indices, t, axis=0, kind="linear", fill_value="extrapolate")
+        indices_new = np.arange(indices.min(), indices.max() + 1)
+        t = interp_func(indices_new)
+    except:
+        breakpoint()
+    return t
+
+def interpolate_rotations(indices: np.ndarray, r: np.ndarray):
+    interp_func = CubicSpline(indices, r, axis=0)
+    indices = np.arange(indices.min(), indices.max() + 1)
+    r = interp_func(indices)
+    return r
+
+def filter_and_interpolate_fingertips(fingertips):
+    all_fingertips, indices = [], []
+    for i, fingertip in enumerate(fingertips):
+        if not torch.any(fingertip == 0):
+            indices.append(i)
+            all_fingertips.append(fingertip.cpu().numpy())
+        else:
+            print(f"Frame {i} has zero fingertips")
+    
+    if indices[-1] != len(fingertips)-1: 
+        all_fingertips.append(all_fingertips[-1])
+        indices.append(len(fingertips)-1)
+    if indices[0] != 0: 
+        all_fingertips.insert(0, all_fingertips[0])
+        indices.insert(0,0)
+
+
+    indices = np.array(indices)
+    all_fingertips = np.array(all_fingertips)
+    all_fingertips = interpolate_translations(indices, all_fingertips)
+    indices = np.arange(indices.min(), indices.max() + 1)
+    all_fingertips = [torch.from_numpy(arr) for arr in all_fingertips]
+    return indices, all_fingertips
 
 def pixel2d_to_3d_torch(points2d, depths, intrinsic_matrix, extrinsic_matrix):
     intrinsic_matrix = torch.tensor(intrinsic_matrix).float().to(depths.device)
@@ -82,80 +193,40 @@ def triangulate_points(P, points):
     return X
 
 
-import numpy as np
-from pathlib import Path
-
-def rigid_transform_3D(A, B, ctx=None, dump_dir=None, dump_limit=50, reflect_log=None):
-    """
-    A, B: Nx3
-    ctx: dict with anything you want (demo_idx, obs_idx, cam, frame_idx, etc.)
-    dump_dir: if provided, dumps problematic A/B pairs when reflection happens
-    reflect_log: list to append reflection events for summary
-    """
+def rigid_transform_3D(A, B):
     assert A.shape == B.shape
-    if A.shape[1] != 3:
-        raise Exception(f"matrix A is not Nx3, it is {A.shape}")
-    if B.shape[1] != 3:
-        raise Exception(f"matrix B is not Nx3, it is {B.shape}")
 
+    num_rows, num_cols = A.shape
+    if num_cols != 3:
+        raise Exception(f"matrix A is not Nx3, it is {num_rows}x{num_cols}")
+
+    num_rows, num_cols = B.shape
+    if num_cols != 3:
+        raise Exception(f"matrix B is not Nx3, it is {num_rows}x{num_cols}")
+
+    # find mean column wise
     centroid_A = np.mean(A, axis=0)
     centroid_B = np.mean(B, axis=0)
 
+    # subtract mean
     Am = A - centroid_A
     Bm = B - centroid_B
 
     H = Am.T @ Bm
 
+    # find rotation
     U, S, Vt = np.linalg.svd(H)
-    Rm = Vt.T @ U.T
-    detR = np.linalg.det(Rm)
+    R = Vt.T @ U.T
 
-    # Useful “degeneracy” signals:
-    # covariance of A, small spread => almost collinear/planar => unstable rotation
-    covA = np.cov(Am.T)
-    evalsA = np.sort(np.linalg.eigvalsh(covA))  # ascending
-    spread = float(evalsA[-1] - evalsA[0])
-
-    # fit error after rotation (before translation)
-    # (not perfect metric, but helpful for ranking)
-    err = float(np.mean(np.linalg.norm((Am @ Rm.T) - Bm, axis=1)))
-
-    if detR < 0:
-        # log with context
-        prefix = "[REFLECT]"
-        if ctx:
-            ctx_str = " ".join([f"{k}={v}" for k, v in ctx.items()])
-            prefix = f"{prefix} {ctx_str}"
-
-        print(f"{prefix} det={detR:+.3f} S={S} evalsA={evalsA} spread={spread:.2e} err={err:.4f}")
-
-        # store event for summary
-        if reflect_log is not None:
-            reflect_log.append({
-                "ctx": dict(ctx) if ctx else {},
-                "det": float(detR),
-                "S": S.copy(),
-                "evalsA": evalsA.copy(),
-                "spread": spread,
-                "err": err,
-            })
-
-        # optionally dump the raw point clouds for later
-        if dump_dir is not None and (reflect_log is None or len(reflect_log) <= dump_limit):
-            dump_dir = Path(dump_dir)
-            dump_dir.mkdir(parents=True, exist_ok=True)
-
-            tag = "unknown"
-            if ctx:
-                tag = "_".join([f"{k}{v}" for k, v in ctx.items()])
-            np.savez_compressed(dump_dir / f"reflect_{tag}.npz", A=A, B=B, S=S, evalsA=evalsA, spread=spread, err=err)
-
-        # correct reflection
+    # special reflection case
+    if np.linalg.det(R) < 0:
+        print("det(R) < R, reflection detected!, correcting for it ...")
         Vt[2, :] *= -1
-        Rm = Vt.T @ U.T
+        R = Vt.T @ U.T
 
-    t = -Rm @ centroid_A.T + centroid_B.T
-    return Rm, t
+    t = -R @ centroid_A.T + centroid_B.T
+
+    return R, t
 
 
 def rotation_6d_to_matrix(d6: np.ndarray) -> np.ndarray:

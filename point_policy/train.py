@@ -103,7 +103,8 @@ class WorkspaceIL:
         self._global_episode = 0
 
         self.video_recorder = VideoRecorder(
-            self.work_dir if self.cfg.save_video else None
+            self.work_dir if self.cfg.save_video else None,
+            calib_path=self.cfg.suite.task_make_fn.calib_path,
         )
 
     @property

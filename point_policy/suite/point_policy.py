@@ -50,6 +50,7 @@ class RGBArrayAsObservationWrapper(dm_env.Environment):
         points_cfg=None,
         use_gt_depth=False,
         point_dim=2,
+        continuous_gripper=False,
     ):
         self._env = env
         self._task_name = task_name
@@ -62,6 +63,7 @@ class RGBArrayAsObservationWrapper(dm_env.Environment):
         self._device = "cpu"
         self._use_gt_depth = use_gt_depth
         self._point_dim = point_dim
+        self.continuous_gripper = continuous_gripper
 
         # track vars
         self._use_robot_points = use_robot_points
@@ -76,6 +78,7 @@ class RGBArrayAsObservationWrapper(dm_env.Environment):
             points_cfg["task_name"] = task_name
             points_cfg["pixel_keys"] = self._pixel_keys
             points_cfg["object_labels"] = object_labels
+            points_cfg["use_gt_depth"] = self._use_gt_depth
             self._points_class = PointsClass(**points_cfg)
 
         # calibration data
@@ -215,6 +218,9 @@ class RGBArrayAsObservationWrapper(dm_env.Environment):
 
         observation["features"] = self._current_pose
         observation["goal_achieved"] = False
+        if 'force' in obs:
+            observation["force"] = obs["force"]
+
         self.observation = observation
         return observation
 
@@ -284,6 +290,9 @@ class RGBArrayAsObservationWrapper(dm_env.Environment):
 
         observation["features"] = self._current_pose
         observation["goal_achieved"] = done
+
+        if 'force' in obs:
+            observation["force"] = obs["force"]
 
         if self._step >= self._max_episode_len:
             done = True
@@ -412,6 +421,9 @@ class RGBArrayAsObservationWrapper(dm_env.Environment):
         gripper_state = self.compute_gripper(action)
         robot_action = self.compute_robot_action(robot_pos, ori, gripper_state)
 
+        if 'future_force_states' in action:
+            robot_action = np.concatenate([robot_action, action['future_force_states'][0]])
+
         return robot_action
 
     def compute_action_from_3dpoints(self, points3d):
@@ -421,17 +433,21 @@ class RGBArrayAsObservationWrapper(dm_env.Environment):
         return robot_pos, ori
 
     def compute_gripper(self, action):
-        print(f"[ACTION DEBUG] Keys in action dict: {action.keys()}")
         gripper_state = action["gripper"][:1]
-        print(f"[GRIPPER DEBUG] pred={gripper_state}, prev={self.prev_gripper_state}")
-
-        if self.prev_gripper_state == -1 and gripper_state > -0.90:
-            gripper_state = 1
-        elif self.prev_gripper_state == 1 and gripper_state < 0.80:
-            gripper_state = -1
+        print("gripper_state", gripper_state)
+        
+        if self.continuous_gripper:
+            gripper_state = gripper_state.item()
         else:
-            gripper_state = self.prev_gripper_state
-        self.prev_gripper_state = gripper_state
+            if 'future_force_states' in action:
+                print("force", action["future_force_states"])
+            if self.prev_gripper_state == -1 and gripper_state > -0.9:
+                gripper_state = 1
+            elif self.prev_gripper_state == 1 and gripper_state < -0.99:
+                gripper_state = -1
+            else:
+                gripper_state = self.prev_gripper_state
+            self.prev_gripper_state = gripper_state
 
         gripper_state = np.array([gripper_state])
         return gripper_state
@@ -449,8 +465,9 @@ class RGBArrayAsObservationWrapper(dm_env.Environment):
         target_position = T_eef[:3, 3]
         target_orientation = T_eef[:3, :3]
 
-        target_position[0] -= 0.005
-        target_position[1] -= 0.01
+        target_position[0] -= 0.000
+        target_position[1] -= 0.00
+        target_position[2] += 0.011
 
         # convert orientation from rotation matrix to quaternion
         target_orientation = R.from_matrix(target_orientation).as_quat()
@@ -626,6 +643,13 @@ def make(
     points_cfg,
     use_gt_depth,
     point_dim,
+    force_controller,
+    read_force,
+    desired_force,
+    force_match_tolerance,
+    variable_desired_force,
+    continuous_gripper,
+
 ):
     env = gym.make(
         "Franka-v1",
@@ -633,6 +657,12 @@ def make(
         width=width,
         use_robot=eval,
         use_gt_depth=use_gt_depth,
+        force_controller=force_controller,
+        read_force=read_force,
+        desired_force=desired_force,
+        force_match_tolerance=force_match_tolerance,
+        variable_desired_force=variable_desired_force,
+
     )
 
     if hasattr(env, '_max_episode_steps'):
@@ -657,6 +687,8 @@ def make(
         points_cfg=points_cfg,
         use_gt_depth=use_gt_depth,
         point_dim=point_dim,
+        continuous_gripper=continuous_gripper,
+
     )
     env = ActionDTypeWrapper(env, np.float32)
     env = ActionRepeatWrapper(env, action_repeat)

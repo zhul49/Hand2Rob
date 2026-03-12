@@ -2,13 +2,20 @@ import cv2
 import argparse
 import numpy as np
 import pickle as pkl
+import torch
 from pathlib import Path
 from scipy.spatial.transform import Rotation as R
 from scipy.spatial.transform import Slerp
 from scipy.ndimage import zoom
 
 from gripper_points import extrapoints, Tshift
-from utils import camera2pixelkey, rigid_transform_3D
+from utils import (
+    camera2pixelkey,
+    rigid_transform_3D,
+    filter_and_interpolate_fingertips,
+    sliding_window_outlier_filter,
+)
+
 
 print("=" * 60)
 print("SCRIPT STARTED")
@@ -24,28 +31,6 @@ def resize_depth_image(depth_image, new_size):
     resized_depth = zoom(depth_image, zoom_factors, order=1)
     return resized_depth
 
-# def add_perp_point(points):
-#     # points shape: (N, 3)
-#     p1 = points[0] # Wrist/Knuckle
-#     p2 = points[-1] # Finger Tip
-    
-#     # Vector along the finger
-#     v = p2 - p1
-    
-#     # Create a vector perpendicular to the finger (e.g., straight Up in Z)
-#     # Ideally, cross product with "Up" vector (0,0,1) to find "Right"
-#     up = np.array([0, 0, 1])
-#     perp = np.cross(v, up)
-    
-#     # If the finger is pointing straight up, use X axis instead
-#     if np.linalg.norm(perp) < 0.001:
-#         perp = np.cross(v, np.array([1, 0, 0]))
-        
-#     perp = perp / np.linalg.norm(perp) * 0.05 # 5cm offset
-    
-#     new_point = p1 + perp
-#     return np.vstack([points, new_point])
-
 # Create the parser
 parser = argparse.ArgumentParser(
     description="Convert human key points in pkl file to robot key points"
@@ -58,6 +43,8 @@ parser.add_argument("--task_name", type=str, help="List of task names")
 parser.add_argument(
     "--use_gt_depth", action="store_true", help="Use ground truth depth"
 )
+parser.add_argument("--smooth_robot_tracks", action="store_true", help="Smooth robot tracks")
+parser.add_argument("--continuous_gripper", action="store_true", help="Continuous gripper")
 
 args = parser.parse_args()
 DATA_DIR = Path(args.data_dir)
@@ -110,6 +97,19 @@ frames_since_open_condition = 0
 observations = []
 for obs_idx, observation in enumerate(DATA["observations"]):
     print(f"Processing observation {obs_idx}")
+    # Reset per demo
+    is_gripper_closed = False
+    frames_since_open_condition = 0
+    last_robot_pos = None
+    last_robot_rot = None
+
+    # --- Preserve sensor data if it exists (Feel the Force) ---
+    if "sensor_states" in observation:
+        sensor_states = observation["sensor_states"]
+        observation["sensor_states"] = sensor_states
+    if "sensor_history" in observation:
+        sensor_history = observation["sensor_history"]
+        observation["sensor_history"] = sensor_history
 
     for cam_idx in camera_indices:
         camera_name = f"cam_{cam_idx}"
@@ -131,6 +131,11 @@ for obs_idx, observation in enumerate(DATA["observations"]):
 
         robot_points, gripper_states = [], []
         human_poses = []
+
+        # Compute max finger distance for continuous gripper mode
+        if args.continuous_gripper:
+            index_finger_thumb_maxdist_demo = max([np.max([np.linalg.norm(hand_points[i][idx1] - hand_points[i][idx2]) for idx1, idx2 in index_finger_thumb_pairs]) for i in range(len(hand_points))])
+
         for idx, hand_point in enumerate(hand_points):
             index_finger_thumb_dists = [
                 np.linalg.norm(hand_point[idx1] - hand_point[idx2])
@@ -195,8 +200,8 @@ for obs_idx, observation in enumerate(DATA["observations"]):
             # shift the point
             T_g_b = T_g_b @ Tshift
 
-            raw_open_signal = (index_finger_thumb_mindist > 0.06)
-            raw_close_signal = (index_finger_thumb_mindist < 0.05)
+            raw_open_signal = (index_finger_thumb_mindist > 0.09)
+            raw_close_signal = (index_finger_thumb_mindist < 0.08)
 
             if is_gripper_closed:
                 # LOCKED: Only open if we see "Open" signal for >5 frames
@@ -205,7 +210,7 @@ for obs_idx, observation in enumerate(DATA["observations"]):
                 else:
                     frames_since_open_condition = 0 
                 
-                if frames_since_open_condition > 1:
+                if frames_since_open_condition > 2:
                     is_gripper_closed = False
                     frames_since_open_condition = 0
             else:
@@ -215,24 +220,45 @@ for obs_idx, observation in enumerate(DATA["observations"]):
                     frames_since_open_condition = 0
             
             gripper_state = 1 if is_gripper_closed else -1
-            # -----------------------------------------
+
+            # # --- Continuous gripper override (Feel the Force) ---
+            # if args.continuous_gripper:
+            #     gripper_state = -1 + 2 * (1 - (index_finger_thumb_mindist / index_finger_thumb_maxdist_demo))
+            #     gripper_state = np.clip(gripper_state, -1, 1)
+            # # -----------------------------------------
 
             # add extra points
             points3d = [T_g_b[:3, 3]]
-            
-            # Note: I renamed 'idx' to 'p_idx' here to avoid bugs!
-            # (Your original code reused 'idx' from the outer loop, which is dangerous)
+            #gripper_state = -1  # -1: open, 1: closed
+            #for idx, Tp in enumerate(extrapoints):
             for p_idx, Tp in enumerate(extrapoints):
-                # Only move the visual gripper points if we are closed
                 if is_gripper_closed and p_idx in [0, 1]:
                     Tp = Tp.copy()
-                    # Visually pinch the gripper fingers
                     Tp[1, 3] = 0.015 if p_idx == 0 else -0.015
+                # if index_finger_thumb_mindist < 0.09 and idx in [0, 1]:
+                #     Tp = Tp.copy()
+                #     Tp[1, 3] = 0.015 if idx == 0 else -0.015
+                    #gripper_state = 1
+
+
+            
+            # # Note: I renamed 'idx' to 'p_idx' here to avoid bugs!
+            # # (Your original code reused 'idx' from the outer loop, which is dangerous)
+            # for p_idx, Tp in enumerate(extrapoints):
+            #     # Only move the visual gripper points if we are closed
+            #     if index_finger_thumb_mindist < 0.09 and p_idx in [0, 1]:
+            #         Tp = Tp.copy()
+            #         # Visually pinch the gripper fingers
+            #         Tp[1, 3] = 0.015 if p_idx == 0 else -0.015
                 
                 pt = T_g_b @ Tp
                 pt = pt[:3, 3]
                 points3d.append(pt)
             points3d = np.array(points3d)
+            if args.continuous_gripper:
+                gripper_state = -1 + 2 * (1 - (index_finger_thumb_mindist / index_finger_thumb_maxdist_demo))
+                gripper_state = np.clip(gripper_state, -1, 1)
+
 
             robot_points.append(points3d)
             gripper_states.append(gripper_state)
@@ -269,5 +295,49 @@ for obs_idx, observation in enumerate(DATA["observations"]):
 
 DATA["observations"] = observations
 
+# --- Preserve sensor normalization data (Feel the Force) ---
+if "max_sensor" in DATA:
+    DATA["max_sensor"] = DATA["max_sensor"]
+if "min_sensor" in DATA:
+    DATA["min_sensor"] = DATA["min_sensor"]
+
+# --- Smooth robot tracks (Feel the Force) ---
+if args.smooth_robot_tracks:
+    for cam_idx in camera_indices:
+        camera_name = f"cam_{cam_idx}"
+        pixel_key = camera2pixelkey[camera_name]
+
+        # Get calibration data once per camera
+        P = calibration_data[camera_name]["ext"]
+        K = calibration_data[camera_name]["int"]
+        D = calibration_data[camera_name]["dist_coeff"]
+        r, t = P[:3, :3], P[:3, 3]
+        r, _ = cv2.Rodrigues(r)
+
+        # Update observations in place
+        for i in range(len(DATA["observations"])):
+            obs = DATA["observations"][i]
+            robot_tracks = obs[f"robot_tracks_3d_{pixel_key}"]
+            robot_tracks_list = [torch.from_numpy(track) for track in robot_tracks]
+
+            # Apply sliding window filter to remove outliers
+            cleaned_tracks = sliding_window_outlier_filter(robot_tracks_list, std_threshold=0.5)
+
+            # Interpolate any missing frames
+            _, smoothed_tracks = filter_and_interpolate_fingertips(cleaned_tracks)
+
+            # Update the observation with smoothed tracks
+            DATA["observations"][i][f"robot_tracks_3d_{pixel_key}"] = torch.stack(smoothed_tracks).numpy()
+
+            # Update 2D projections
+            robot_points_2d = []
+            for points3d in DATA["observations"][i][f"robot_tracks_3d_{pixel_key}"]:
+                points2d = cv2.projectPoints(points3d, r, t, K, D)[0].squeeze()
+                robot_points_2d.append(points2d)
+            DATA["observations"][i][f"robot_tracks_{pixel_key}"] = np.array(robot_points_2d)
+
 # save data
-pkl.dump(DATA, open(SAVE_DIR / f"{task_name}.pkl", "wb"))
+if args.continuous_gripper:
+    pkl.dump(DATA, open(SAVE_DIR / f"{task_name}_continuous.pkl", "wb"))
+else:
+    pkl.dump(DATA, open(SAVE_DIR / f"{task_name}.pkl", "wb"))
